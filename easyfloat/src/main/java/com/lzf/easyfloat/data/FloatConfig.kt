@@ -79,5 +79,10 @@ data class FloatConfig(
     internal var needShow: Boolean = true,
 
     // 当layout大小变化后，整体view的位置的摆放
-    var layoutChangedGravity: Int = Gravity.TOP.or(Gravity.START)
+    var layoutChangedGravity: Int = Gravity.TOP.or(Gravity.START),
+
+    // 深色模式等 UI 模式变化后，是否按新配置重建浮窗内的视图。
+    // 浮窗视图不在 Activity 的布局树里，inflate 时解析出的颜色/主题不会跟着配置变化刷新，
+    // 需要重新 inflate 才能拿到 values-night 里的资源。
+    var refreshOnConfigChange: Boolean = true
 )

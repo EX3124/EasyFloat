@@ -235,6 +235,20 @@ class EasyFloat {
         }
 
         /**
+         * 设置 UI 模式（深色/浅色）切换后，是否按新配置重建浮窗内的视图，默认开启。
+         *
+         * 浮窗不在 Activity 的布局树里，inflate 时解析出的颜色、drawable、主题属性不会
+         * 随配置变化自动刷新，所以在 uiMode 变化时需要重新 inflate 一次内容视图。
+         * 重建只替换浮窗内的内容 view，窗口位置、尺寸、拖拽、显示状态都保持不变，
+         * 重建完成后会再次回调 [setLayout] 中的 view 回调，宿主可在其中重新绑定数据。
+         * 使用 [setLayout] 直接传入外部 View 时无法自动重建，需要宿主自行处理。
+         * @param enable    是否自动重建
+         */
+        fun setRefreshOnConfigChange(enable: Boolean) = apply {
+            config.refreshOnConfigChange = enable
+        }
+
+        /**
          * 设置浮窗的起始坐标，优先级高于setGravity
          * @param x     起始水平坐标
          * @param y     起始竖直坐标

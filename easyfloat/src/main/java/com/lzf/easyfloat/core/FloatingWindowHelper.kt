@@ -3,8 +3,11 @@ package com.lzf.easyfloat.core
 import android.animation.Animator
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Application
 import android.app.Service
+import android.content.ComponentCallbacks
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -45,6 +48,11 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
     private var lastLayoutMeasureWidth = -1
     private var lastLayoutMeasureHeight = -1
 
+    // 上一次的深色模式状态：窗口回调和 Application 回调可能重复送达，用它去重
+    private var lastNightMode = -1
+    // Application 级配置变化监听：浮窗常驻时窗口自身不一定能收到 onConfigurationChanged
+    private var appConfigCallbacks: ComponentCallbacks? = null
+
     // 屏幕旋转/尺寸变化监听，用于旋转后刷新拖动边界
     private var displayListener: DisplayManager.DisplayListener? = null
     // 屏幕变化后的边界刷新：只在边界真正按当前屏幕更新成功后结束，否则继续重试
@@ -73,6 +81,7 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         touchUtils = TouchUtils(context, config)
         // 拖拽期间被推迟的边界刷新，在手指抬起后补做
         touchUtils.gestureEndCallback = { onGestureEnd() }
+        lastNightMode = nightModeOf(context.resources.configuration)
         initParams()
         addView()
         config.isShow = true
@@ -196,12 +205,14 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
 
         setChangedListener()
 
-        // 屏幕旋转、折叠屏展开等不会触发触摸事件，需要主动监听并刷新边界。
+        // 屏幕旋转、折叠屏展开、深色模式切换等不会触发触摸事件，需要主动监听。
         // 窗口真正收到配置变化时，方向确实变了，丢弃此前按手指坐标做的屏幕尺寸校正
-        frameLayout?.configChangedListener = {
+        frameLayout?.configChangedListener = { newConfig ->
             touchUtils.invalidateScreenCorrection()
             onScreenSizeChanged()
+            onUiModeChanged(newConfig)
         }
+        registerAppConfigListener()
         registerDisplayListener()
     }
 
@@ -242,6 +253,142 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
             }
         }
         displayListener = null
+    }
+
+    private fun nightModeOf(newConfig: Configuration): Int =
+        newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK
+
+    /**
+     * 注册 Application 级的配置变化监听。
+     *
+     * 切换深色模式 / 浅色模式时，浮窗窗口自身不一定能收到 onConfigurationChanged
+     * （浮窗常驻、宿主 Activity 已经重建、或者应用在后台时都可能收不到），
+     * 这里作为兜底通道，保证 uiMode 变化一定能触发视图刷新。
+     * 和窗口回调可能重复送达，内部按 uiMode 去重。
+     */
+    private fun registerAppConfigListener() {
+        if (appConfigCallbacks != null) return
+        // Activity 内的浮窗跟随 Activity 生命周期，配置变化时 Activity 会自行重建，无需额外处理
+        if (config.showPattern == ShowPattern.CURRENT_ACTIVITY) return
+        val application = context.applicationContext as? Application ?: return
+        val callbacks = object : ComponentCallbacks {
+            override fun onConfigurationChanged(newConfig: Configuration) {
+                onUiModeChanged(newConfig)
+            }
+
+            override fun onLowMemory() {}
+        }
+        try {
+            application.registerComponentCallbacks(callbacks)
+            appConfigCallbacks = callbacks
+        } catch (e: Exception) {
+            Logger.e("配置变化监听注册失败：$e")
+        }
+    }
+
+    private fun unregisterAppConfigListener() {
+        val callbacks = appConfigCallbacks ?: return
+        appConfigCallbacks = null
+        try {
+            (context.applicationContext as? Application)?.unregisterComponentCallbacks(callbacks)
+        } catch (e: Exception) {
+            Logger.e("配置变化监听注销失败：$e")
+        }
+    }
+
+    /**
+     * uiMode（深色/浅色）变化后刷新浮窗内容。
+     *
+     * 浮窗不在 Activity 的布局树里，inflate 时解析出的颜色、drawable、主题属性都已经固化，
+     * 不会随配置变化自动刷新，只能重新 inflate 一次内容视图。
+     */
+    private fun onUiModeChanged(newConfig: Configuration) {
+        if (!config.refreshOnConfigChange) return
+        val nightMode = nightModeOf(newConfig)
+        if (lastNightMode == nightMode) return
+        lastNightMode = nightMode
+        refreshLayout(newConfig)
+    }
+
+    /**
+     * 用新配置重新 inflate 浮窗内容。
+     *
+     * 只替换浮窗内的内容 view，窗口本身不变：位置、尺寸、拖拽监听、显示/隐藏状态全部保留，
+     * 因此不会出现 dismiss 后需要用户手动重开的窗口，也不需要重建 WindowManager 窗口。
+     * 重建完成后会再次回调宿主的 [FloatConfig.invokeView]，宿主可以在其中重新绑定数据与监听。
+     */
+    private fun refreshLayout(newConfig: Configuration) {
+        val parent = frameLayout ?: return
+        // 通过 setLayout(View) 直接传入外部 View 时没有 layoutId，无法自动重建，交由宿主处理
+        val layoutId = config.layoutId ?: return
+        if (parent.childCount == 0) return
+
+        val oldView = parent.getChildAt(0)
+        val oldWidth = oldView.layoutParams?.width ?: -1
+        val oldHeight = oldView.layoutParams?.height ?: -1
+        val oldVisible = oldView.visibility
+
+        // 先完成新视图的 inflate，再移除旧视图，尽量减少中间出现的空白帧
+        val inflateContext = resolveInflateContext(newConfig)
+        val newView = LayoutInflater.from(inflateContext).inflate(layoutId, parent, false)
+        newView.visibility = oldVisible
+
+        // 只移除内容 view：不会触发 ParentFrameLayout.onDetachedFromWindow 里的 dismiss 回调
+        parent.removeAllViews()
+        parent.addView(newView)
+
+        config.layoutView = newView
+        // 重建后重新回调宿主，让宿主把数据和监听绑定到新视图上
+        config.invokeView?.invoke(newView)
+
+        // 恢复重建前的布局参数：用户手动拖拽调整过尺寸时，尺寸保存在内容 view 的
+        // LayoutParams 上，重新 inflate 后已经回到 xml 里的默认值
+        newView.layoutParams?.let {
+            it.width = oldWidth
+            it.height = oldHeight
+            newView.layoutParams = it
+        }
+
+        initEditText()
+        parent.requestLayout()
+    }
+
+    /**
+     * 取一个「按新配置解析资源」的 Context。
+     *
+     * 浮窗视图的 context 通常是创建浮窗时的 Activity，切换深色模式后该 Activity 可能已经被
+     * 销毁重建，或者它持有的 Resources / Theme 仍是旧配置。这里用回调里的新配置显式创建
+     * Context，并重新套用浮窗所在 Activity（或应用）的主题，让 inflate 能解析到 values-night
+     * 下的颜色、drawable 与主题属性（?attr/xxx）。
+     */
+    private fun resolveInflateContext(newConfig: Configuration): Context {
+        val base = context.applicationContext ?: context
+        val configured = if (base.resources.configuration.diff(newConfig) == 0) base
+        else base.createConfigurationContext(newConfig)
+        val themeRes = themeResId()
+        return if (themeRes != 0) ContextThemeWrapper(configured, themeRes) else configured
+    }
+
+    /**
+     * 浮窗视图使用的主题：优先 Activity 在 manifest 里声明的主题，其次应用级主题。
+     *
+     * 必须显式拿到主题资源，新 Context 才能按新配置重新解析主题属性。
+     */
+    private fun themeResId(): Int {
+        val activity = context as? Activity
+        if (activity != null) {
+            try {
+                val theme = context.packageManager.getActivityInfo(activity.componentName, 0).theme
+                if (theme != 0) return theme
+            } catch (e: Exception) {
+                Logger.e("获取 Activity 主题失败：$e")
+            }
+        }
+        return try {
+            context.packageManager.getApplicationInfo(context.packageName, 0).theme
+        } catch (e: Exception) {
+            0
+        }
     }
 
     /**
@@ -572,6 +719,7 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         // 清掉手势状态，避免标记残留导致之后的边界刷新被一直推迟
         if (this::touchUtils.isInitialized) touchUtils.resetGestureState()
         unregisterDisplayListener()
+        unregisterAppConfigListener()
         FloatingWindowManager.remove(config.floatTag)
         // removeView是异步删除，在Activity销毁的时候会导致窗口泄漏，所以使用removeViewImmediate直接删除view
         windowManager.run { if (force) removeViewImmediate(frameLayout) else removeView(frameLayout) }

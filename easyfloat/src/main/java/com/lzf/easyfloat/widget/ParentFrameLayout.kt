@@ -27,8 +27,8 @@ internal class ParentFrameLayout(
     var touchListener: OnFloatTouchListener? = null
     var layoutListener: OnLayoutListener? = null
 
-    // 屏幕配置变化（旋转、尺寸、字体等）的回调，用于重新计算浮窗的拖动边界
-    var configChangedListener: (() -> Unit)? = null
+    // 屏幕配置变化（旋转、尺寸、字体、深色模式等）的回调，用于重新计算拖动边界、刷新视图
+    var configChangedListener: ((Configuration) -> Unit)? = null
     private var isCreated = false
 
     // 布局绘制完成的接口，用于通知外部做一些View操作，不然无法获取view宽高
@@ -51,7 +51,7 @@ internal class ParentFrameLayout(
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        configChangedListener?.invoke()
+        configChangedListener?.invoke(newConfig)
     }
 
     override fun onInterceptTouchEvent(event: MotionEvent?): Boolean {
