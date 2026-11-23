@@ -66,7 +66,9 @@ open class DefaultAnimator : OnFloatAnimator {
         sidePattern: SidePattern
     ): Triple<Int, Int, Boolean> {
         val parentRect = Rect()
-        windowManager.defaultDisplay.getRectSize(parentRect)
+        // Android 12 起 Display#getRectSize 返回的是 App 窗口区域，可能停留在旋转前的竖屏尺寸
+        parentRect.right = DisplayUtils.getScreenWidth(view.context)
+        parentRect.bottom = DisplayUtils.getScreenHeight(view.context)
         // 浮窗各边到窗口边框的距离
         val leftDistance = params.x
         val rightDistance = parentRect.right - (leftDistance + view.right)

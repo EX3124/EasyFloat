@@ -243,6 +243,10 @@ class EasyFloat {
 
         /**
          * 设置浮窗的拖拽边距值
+         *
+         * 注意：right、bottom 默认不做限制（随屏幕大小变化）。不要在这里传入
+         * getScreenWidth/getScreenHeight 的当前值，否则横竖屏切换后，
+         * 拖动边界会一直停留在创建浮窗时的竖屏尺寸上。
          * @param left      浮窗左侧边距
          * @param top       浮窗顶部边距
          * @param right     浮窗右侧边距
@@ -252,8 +256,8 @@ class EasyFloat {
         fun setBorder(
             left: Int = 0,
             top: Int = -DisplayUtils.getStatusBarHeight(activity),
-            right: Int = DisplayUtils.getScreenWidth(activity),
-            bottom: Int = DisplayUtils.getScreenHeight(activity)
+            right: Int = Int.MAX_VALUE,
+            bottom: Int = Int.MAX_VALUE
         ) = apply {
             config.leftBorder = left
             config.topBorder = top

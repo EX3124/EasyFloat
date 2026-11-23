@@ -7,8 +7,11 @@ import android.app.Service
 import android.content.Context
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.*
 import android.view.WindowManager.LayoutParams.*
 import android.widget.EditText
@@ -42,6 +45,17 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
     private var lastLayoutMeasureWidth = -1
     private var lastLayoutMeasureHeight = -1
 
+    // 屏幕旋转/尺寸变化监听，用于旋转后刷新拖动边界
+    private var displayListener: DisplayManager.DisplayListener? = null
+    // 屏幕变化后的边界刷新：只在边界真正按当前屏幕更新成功后结束，否则继续重试
+    private var screenCheckScheduled = false
+    private var screenCheckAttempt = 0
+    // 拖拽期间不能刷新边界（会把浮窗拉走），先记录下来，手指抬起后补做
+    private var refreshAfterGesture = false
+    private val screenCheckRunnable = Runnable { checkScreenSizeChanged() }
+    // 屏幕变化后的重试间隔（ms），旋转时系统完成窗口重新布局的时机并不固定
+    private val screenCheckDelays = longArrayOf(0, 16, 32, 64, 120, 200, 320, 500)
+
     fun createWindow(callback: CreateCallback) {
         // 如果在onCreate创建单页面浮窗，会存在获取windowToken为空的情况，需要异步创建
         if (config.showPattern == ShowPattern.CURRENT_ACTIVITY && getToken() == null) {
@@ -57,6 +71,8 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
 
     private fun createWindowInner(): Boolean = try {
         touchUtils = TouchUtils(context, config)
+        // 拖拽期间被推迟的边界刷新，在手指抬起后补做
+        touchUtils.gestureEndCallback = { onGestureEnd() }
         initParams()
         addView()
         config.isShow = true
@@ -67,6 +83,7 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         false
     }
 
+    @SuppressLint("NewApi")
     private fun initParams() {
         windowManager = context.getSystemService(Service.WINDOW_SERVICE) as WindowManager
         params = WindowManager.LayoutParams().apply {
@@ -88,6 +105,26 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
             // 没有边界限制，允许窗口扩展到屏幕外
                 FLAG_NOT_TOUCH_MODAL or FLAG_NOT_FOCUSABLE or FLAG_LAYOUT_NO_LIMITS
             else FLAG_NOT_TOUCH_MODAL or FLAG_NOT_FOCUSABLE
+
+            // 允许浮窗覆盖刘海/挖孔所在的区域。
+            //
+            // 系统默认按 LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT 处理：非全屏窗口会被限制在
+            // “挖孔安全区”之外。横屏时如果挖孔位于屏幕左侧，系统会把浮窗的窗口坐标原点整体
+            // 右移一个挖孔宽度的距离，于是屏幕最左侧那一块（挖孔区）永远拖不到，而右边界又按
+            // 未偏移的整屏宽度计算，浮窗能拖出屏幕右侧；挖孔位于右侧时窗口本来就不与挖孔相交，
+            // 所以 90° 和 270° 的表现完全不同。显式声明允许覆盖挖孔区之后，窗口坐标原点重新
+            // 对齐屏幕左上角，这两个现象会一起消失。
+            layoutInDisplayCutoutMode = when {
+                // Android 11（API 30）起：不要求窗口全屏，也可以扩展到所有挖孔区域
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
+                    LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                // Android 9、10：只支持扩展到短边方向的挖孔区域
+                // （横屏时挖孔位于屏幕左右两侧，正属于短边）
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ->
+                    LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                else -> LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+            }
+
             width = if (config.widthMatch) MATCH_PARENT else WRAP_CONTENT
             height = if (config.heightMatch) MATCH_PARENT else WRAP_CONTENT
 
@@ -158,6 +195,128 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         }
 
         setChangedListener()
+
+        // 屏幕旋转、折叠屏展开等不会触发触摸事件，需要主动监听并刷新边界。
+        // 窗口真正收到配置变化时，方向确实变了，丢弃此前按手指坐标做的屏幕尺寸校正
+        frameLayout?.configChangedListener = {
+            touchUtils.invalidateScreenCorrection()
+            onScreenSizeChanged()
+        }
+        registerDisplayListener()
+    }
+
+    /**
+     * 注册屏幕变化监听：Android 12 起横屏后浮窗坐标和尺寸都不会自动刷新，
+     * 需要主动重新计算拖动边界，并把浮窗拉回屏幕内。
+     */
+    private fun registerDisplayListener() {
+        if (displayListener != null) return
+        val manager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+
+            override fun onDisplayRemoved(displayId: Int) {}
+
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId == Display.DEFAULT_DISPLAY) onScreenSizeChanged()
+            }
+        }
+        try {
+            manager.registerDisplayListener(listener, Handler(Looper.getMainLooper()))
+            displayListener = listener
+        } catch (e: Exception) {
+            Logger.e("屏幕变化监听注册失败：$e")
+        }
+    }
+
+    /**
+     * 注销屏幕变化监听
+     */
+    private fun unregisterDisplayListener() {
+        displayListener?.let {
+            try {
+                (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                    ?.unregisterDisplayListener(it)
+            } catch (e: Exception) {
+                Logger.e("屏幕变化监听注销失败：$e")
+            }
+        }
+        displayListener = null
+    }
+
+    /**
+     * 屏幕可用区域变化（旋转、折叠屏展开、导航栏切换）后，重新计算拖动边界并拉回浮窗。
+     *
+     * 边界原本只在触摸按下时计算，旋转屏幕时没有任何触摸事件：
+     * 横屏后浮窗停留在竖屏坐标上（看起来没贴边），转回竖屏时又跑到屏幕外。
+     *
+     * 旋转过程中系统回调的时机并不统一，第一次回调时可能还没完成窗口重新布局，
+     * 或者读到的屏幕尺寸仍是旋转前的值，所以这里不是"回调一次就算做完"，
+     * 而是用实际读到的屏幕尺寸复核：只要边界还没按当前屏幕更新过就继续重试，
+     * 直到应用成功，避免浮窗停在屏幕外。
+     */
+    internal fun onScreenSizeChanged() {
+        if (screenCheckScheduled) return
+        screenCheckScheduled = true
+        screenCheckAttempt = 0
+        checkScreenSizeChanged()
+    }
+
+    private fun checkScreenSizeChanged(): Unit {
+        val layout = frameLayout
+        if (layout == null || layout.windowToken == null) {
+            screenCheckScheduled = false
+            return
+        }
+        // 拖拽过程中不能改动坐标：重算边界 + 贴边会让浮窗明显跳一下，推迟到手指抬起后补做
+        if (touchUtils.isGestureInProgress) {
+            refreshAfterGesture = true
+            screenCheckScheduled = false
+            return
+        }
+        // 窗口还没完成重新布局（旋转瞬间宽高可能为 0），稍后重试
+        if (layout.width <= 0 || layout.height <= 0) return retryScreenCheck()
+        // 吸附/入场动画进行中先等它结束（重新计算边界时会取消旧动画）；
+        // 只有等完整个重试周期仍在动画中（可能是残留状态）才直接接管，避免一直不贴边
+        if (config.isAnim && screenCheckAttempt < screenCheckDelays.size - 1) return retryScreenCheck()
+
+        val applied = try {
+            touchUtils.updateBoundary(layout, params, windowManager)
+        } catch (e: Exception) {
+            false
+        }
+        // 只有边界已经按当前屏幕尺寸算过才算处理完成；
+        // 否则说明这一刻拿到的还是旋转前的尺寸，需要继续重试
+        if (applied && touchUtils.isBoundaryUpToDate()) {
+            screenCheckScheduled = false
+            return
+        }
+        retryScreenCheck()
+    }
+
+    private fun retryScreenCheck() {
+        val layout = frameLayout
+        if (layout == null) {
+            screenCheckScheduled = false
+            return
+        }
+        if (screenCheckAttempt >= screenCheckDelays.size) {
+            // 本轮重试结束。仍会保留窗口重新布局时的兜底检查（见 setChangedListener）
+            screenCheckScheduled = false
+            return
+        }
+        val delay = screenCheckDelays[screenCheckAttempt]
+        screenCheckAttempt++
+        layout.postDelayed(screenCheckRunnable, delay)
+    }
+
+    /**
+     * 拖拽手势结束：补做拖拽期间被推迟的屏幕变化刷新
+     */
+    private fun onGestureEnd() {
+        if (!refreshAfterGesture) return
+        refreshAfterGesture = false
+        onScreenSizeChanged()
     }
 
     /**
@@ -167,6 +326,15 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         frameLayout?.apply {
             // 监听frameLayout布局完成
             viewTreeObserver?.addOnGlobalLayoutListener {
+                // 旋转屏幕后窗口会重新布局，这时是重新贴边最可靠的时机；
+                // 如果边界还是按旋转前的屏幕尺寸算的，就再刷新一次。
+                // 拖拽时每次 updateViewLayout 都会走到这里，此时绝不能改坐标，否则浮窗会跳；
+                // 只有边界确实过期（例如拖拽过程中旋转了屏幕）才记为待处理，避免每次拖拽都多做一次刷新
+                if (touchUtils.isGestureInProgress) {
+                    if (!touchUtils.isBoundaryUpToDate()) refreshAfterGesture = true
+                } else if (!screenCheckScheduled && !touchUtils.isBoundaryUpToDate()) {
+                    onScreenSizeChanged()
+                }
                 val filterInvalidVal = lastLayoutMeasureWidth == -1 || lastLayoutMeasureHeight == -1
                 val filterEqualVal =
                     lastLayoutMeasureWidth == this.measuredWidth && lastLayoutMeasureHeight == this.measuredHeight
@@ -240,8 +408,9 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
     private fun setGravity(view: View?) {
         if (config.locationPair != Pair(0, 0) || view == null) return
         val parentRect = Rect()
-        // 获取浮窗所在的矩形
-        windowManager.defaultDisplay.getRectSize(parentRect)
+        // 获取浮窗所在的矩形：Android 12 起 Display#getRectSize 返回的是 App 窗口区域，
+        // 可能停留在旋转前的竖屏尺寸，这里改用统一的屏幕尺寸
+        parentRect.right = DisplayUtils.getScreenWidth(context)
         val location = IntArray(2)
         // 获取在整个屏幕内的绝对坐标
         view.getLocationOnScreen(location)
@@ -315,6 +484,8 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         val view = frameLayout!!.getChildAt(0)
         if (visible == View.VISIBLE) {
             config.isShow = true
+            // 隐藏期间（后台浮窗、悬浮窗被收起）旋转了屏幕，显示时按当前屏幕重新贴边
+            if (!touchUtils.isBoundaryUpToDate()) onScreenSizeChanged()
             config.callbacks?.show(view)
             config.floatCallbacks?.builder?.show?.invoke(view)
         } else {
@@ -393,6 +564,14 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
      */
     fun remove(force: Boolean = false) = try {
         config.isAnim = false
+        // 取消还没执行的屏幕变化检查，避免浮窗移除后继续回调
+        screenCheckScheduled = false
+        screenCheckAttempt = 0
+        refreshAfterGesture = false
+        frameLayout?.removeCallbacks(screenCheckRunnable)
+        // 清掉手势状态，避免标记残留导致之后的边界刷新被一直推迟
+        if (this::touchUtils.isInitialized) touchUtils.resetGestureState()
+        unregisterDisplayListener()
         FloatingWindowManager.remove(config.floatTag)
         // removeView是异步删除，在Activity销毁的时候会导致窗口泄漏，所以使用removeViewImmediate直接删除view
         windowManager.run { if (force) removeViewImmediate(frameLayout) else removeView(frameLayout) }
@@ -407,7 +586,7 @@ internal class FloatingWindowHelper(val context: Context, var config: FloatConfi
         frameLayout?.let {
             if (x == -1 && y == -1 && width == -1 && height == -1) {
                 // 未指定具体坐标，执行吸附动画
-                it.postDelayed({ touchUtils.updateFloat(it, params, windowManager) }, 200)
+                it.postDelayed({ touchUtils.updateBoundary(it, params, windowManager) }, 200)
             } else {
                 if (x != -1) params.x = x
                 if (y != -1) params.y = y
